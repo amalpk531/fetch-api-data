@@ -12,6 +12,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+# Load local credentials and optional settings without overriding shell variables.
 load_dotenv(Path(__file__).with_name(".env"))
 
 DEFAULT_API_URL = "https://api.petpooja.com/V1/orders/get_sales_data/"
@@ -36,6 +37,7 @@ CREATE TABLE IF NOT EXISTS sales_data (
 )
 """
 
+# Keep insert order aligned with the table and the mapped row tuple.
 SALES_COLUMNS = (
     "receipt_number",
     "sale_date",
@@ -66,11 +68,12 @@ FIELD_MAP = {
 
 
 def normalize_key(value: str) -> str:
+    """Ignore case, spaces, and punctuation when matching API field names."""
     return "".join(character for character in value.lower() if character.isalnum())
 
 
 def extract_records(payload: Any) -> list[dict[str, Any]]:
-    """Find sales rows in either a direct list or a typical API response envelope."""
+    """Find sales rows in a direct list or a nested API response envelope."""
     if isinstance(payload, list):
         if all(isinstance(item, dict) for item in payload):
             return payload
@@ -80,10 +83,15 @@ def extract_records(payload: Any) -> list[dict[str, Any]]:
         raise ValueError("The API response must be a JSON object or list")
 
     status = payload.get("status", payload.get("success"))
-    if status is False or (isinstance(status, str) and status.lower() in {"0", "false", "error"}):
+    failed_status = status is False or (
+        isinstance(status, str)
+        and status.lower() in {"0", "false", "error"}
+    )
+    if failed_status:
         message = payload.get("message", "API reported an unsuccessful response")
         raise ValueError(str(message))
 
+    # Prefer common response containers before searching other nested objects.
     preferred_keys = {"data", "salesdata", "orders", "result", "records"}
     for key, value in payload.items():
         if normalize_key(str(key)) in preferred_keys:
@@ -103,6 +111,7 @@ def extract_records(payload: Any) -> list[dict[str, Any]]:
 
 
 def _number(value: Any) -> float | None:
+    """Convert a numeric API value to float, allowing comma separators."""
     if value is None or value == "":
         return None
     if isinstance(value, str):
@@ -114,19 +123,29 @@ def _number(value: Any) -> float | None:
 
 
 def map_record(record: dict[str, Any]) -> tuple[Any, ...]:
+    """Map one API record to values ordered for insertion into sales_data."""
     values = {normalize_key(str(key)): value for key, value in record.items()}
     mapped = {
         column: values.get(normalize_key(source_field))
         for source_field, column in FIELD_MAP.items()
     }
 
-    for column in ("sale_amount", "tax_amount", "discount_amount", "round_off", "net_sale"):
+    numeric_columns = (
+        "sale_amount",
+        "tax_amount",
+        "discount_amount",
+        "round_off",
+        "net_sale",
+    )
+    for column in numeric_columns:
         mapped[column] = _number(mapped[column])
 
     return tuple(mapped[column] for column in SALES_COLUMNS)
 
 
 def create_session() -> requests.Session:
+    """Create an HTTP session that retries temporary GET failures."""
+    # Retry rate limits and common server errors, with a delay between attempts.
     retry = Retry(
         total=4,
         connect=4,
@@ -143,11 +162,20 @@ def create_session() -> requests.Session:
 
 
 def fetch_sales() -> list[dict[str, Any]]:
-    required = ("PETPOOJA_APP_KEY", "PETPOOJA_APP_SECRET", "PETPOOJA_ACCESS_TOKEN", "PETPOOJA_REST_ID")
+    """Request sales for the configured date range and parse the JSON rows."""
+    required = (
+        "PETPOOJA_APP_KEY",
+        "PETPOOJA_APP_SECRET",
+        "PETPOOJA_ACCESS_TOKEN",
+        "PETPOOJA_REST_ID",
+    )
     missing = [name for name in required if not os.getenv(name)]
     if missing:
-        raise ValueError("Missing required environment variables: " + ", ".join(missing))
+        # Stop before making a request if any required credential is unavailable.
+        missing_names = ", ".join(missing)
+        raise ValueError(f"Missing required environment variables: {missing_names}")
 
+    # Keep credentials in environment variables instead of source code.
     params = {
         "app_key": os.environ["PETPOOJA_APP_KEY"],
         "app_secret": os.environ["PETPOOJA_APP_SECRET"],
@@ -165,37 +193,54 @@ def fetch_sales() -> list[dict[str, Any]]:
             )
         response.raise_for_status()
     except requests.RequestException as error:
-        raise ValueError(f"API request failed ({type(error).__name__}); request details were suppressed") from None
+        # Do not include the request URL, which contains credential query parameters.
+        message = (
+            f"API request failed ({type(error).__name__}); "
+            "request details were suppressed"
+        )
+        raise ValueError(message) from None
     try:
         payload = response.json()
     except requests.exceptions.JSONDecodeError as error:
+        # Convert invalid response content into a clear sync error.
         raise ValueError("The API response was not valid JSON") from error
+    # extract_records also rejects API envelopes that report failure.
     return extract_records(payload)
 
 
-def store_sales(records: list[dict[str, Any]], database_path: Path = DATABASE_PATH) -> int:
+def store_sales(
+    records: list[dict[str, Any]],
+    database_path: Path = DATABASE_PATH,
+) -> int:
+    """Insert sales rows, skipping only rows identical in every mapped field."""
     columns = ", ".join(SALES_COLUMNS)
     placeholders = ", ".join("?" for _ in SALES_COLUMNS)
-    duplicate_conditions = " AND ".join(f"existing.{column} IS ?" for column in SALES_COLUMNS)
+    duplicate_conditions = " AND ".join(
+        f"existing.{column} IS ?" for column in SALES_COLUMNS
+    )
+    # SQLite's IS comparison treats NULL values as equal for exact-row matching.
     insert_sql = (
         f"INSERT INTO sales_data ({columns}) "
         f"SELECT {placeholders} WHERE NOT EXISTS "
         f"(SELECT 1 FROM sales_data AS existing WHERE {duplicate_conditions})"
     )
-    # The prior version used a receipt/date/time unique index. Drop it so only
-    # fully identical records are treated as duplicates.
     rows = [map_record(record) for record in records]
 
     with closing(sqlite3.connect(database_path)) as connection:
         with connection:
             connection.execute(CREATE_TABLE_SQL)
+            # Remove the legacy index; duplicate checks compare every sales field.
             connection.execute("DROP INDEX IF EXISTS idx_sales_data_receipt_key")
+            # Bind each row twice: once for insertion and once for duplicate lookup.
             cursor = connection.executemany(insert_sql, [row + row for row in rows])
     return cursor.rowcount
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Fetch Petpooja sales and store them in SQLite.")
+    """Run the initialization or fetch-and-store command-line flow."""
+    parser = argparse.ArgumentParser(
+        description="Fetch Petpooja sales and store them in SQLite."
+    )
     parser.add_argument(
         "--init-db",
         action="store_true",
@@ -208,16 +253,25 @@ def main() -> int:
             with closing(sqlite3.connect(DATABASE_PATH)) as connection:
                 with connection:
                     connection.execute(CREATE_TABLE_SQL)
-                    connection.execute("DROP INDEX IF EXISTS idx_sales_data_receipt_key")
+                    # Keep initialized databases consistent with the import path.
+                    connection.execute(
+                        "DROP INDEX IF EXISTS idx_sales_data_receipt_key"
+                    )
             print(f"Initialized database: {DATABASE_PATH}")
             return 0
 
         records = fetch_sales()
         inserted = store_sales(records)
-        print(f"Fetched {len(records)} sales record(s); inserted {inserted} into {DATABASE_PATH}.")
+        print(
+            f"Fetched {len(records)} sales record(s); "
+            f"inserted {inserted} into {DATABASE_PATH}."
+        )
         return 0
     except (requests.RequestException, sqlite3.Error, ValueError) as error:
-        print(f"Sales sync failed: {error}", file=sys.stderr)
+        print(
+            f"Sales sync failed: {error}",
+            file=sys.stderr,
+        )
         return 1
 
 

@@ -38,3 +38,7 @@ The date range can be changed with `PETPOOJA_FROM_DATE` and `PETPOOJA_TO_DATE` i
 
 The script skips rows that exactly match existing sales data. A message such as `inserted 0` means the fetched records were already stored.
 
+## Error handling
+
+Temporary API failures and rate limits are retried up to four times. If the request still fails, the response is not valid JSON, or the API reports an unsuccessful result, the script prints an error and exits with a non-zero status. Request details are suppressed to avoid exposing credentials.
+
